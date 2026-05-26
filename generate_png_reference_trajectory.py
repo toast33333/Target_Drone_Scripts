@@ -76,6 +76,7 @@ DEFAULT_ARGS = {
     "max_yaw_rate": 1.0,
     "max_side_step_deg": 30.0,
     "post_ref_closest_window": 0.5,
+    "ref_collision_threshold": REF_COLLISION_THRESHOLD_M,
     "out_dir": None,
 }
 
@@ -106,6 +107,7 @@ CONFIG_TYPES = {
     "max_yaw_rate": float,
     "max_side_step_deg": float,
     "post_ref_closest_window": float,
+    "ref_collision_threshold": float,
     "out_dir": str,
 }
 
@@ -164,6 +166,7 @@ max_side_step_deg = 30.0
 
 [output]
 post_ref_closest_window = 0.5
+ref_collision_threshold = 0.15
 out_dir =
 """
 
@@ -804,21 +807,23 @@ def make_plots(out_dir, rel_t, target_xy, real_xy, ref_xy, ref_heading,
     xy_real_dist = real_dist if xy_real_dist_full is None else xy_real_dist_full
 
     fig, ax = plt.subplots(figsize=(8.5, 7.0))
-    ax.plot(xy_target[:, 0], xy_target[:, 1], label="target real XY", linewidth=2, color="tab:green")
-    ax.plot(xy_real[:, 0], xy_real[:, 1], label="test real work-segment XY", linewidth=2, color="tab:blue")
+    target_color = "tab:blue"
+    test_color = "tab:purple"
+    ax.plot(xy_target[:, 0], xy_target[:, 1], label="target real XY", linewidth=2, color=target_color)
+    ax.plot(xy_real[:, 0], xy_real[:, 1], label="test real work-segment XY", linewidth=2, color=test_color)
     ax.plot(ref_xy[:, 0], ref_xy[:, 1], label="PNG reference XY", linewidth=2, linestyle="--", color="tab:orange")
-    ax.scatter([xy_target[0, 0]], [xy_target[0, 1]], marker="o", s=40, label="target start")
-    ax.scatter([xy_real[0, 0]], [xy_real[0, 1]], marker="s", s=40, label="test start")
+    ax.scatter([xy_target[0, 0]], [xy_target[0, 1]], marker="o", s=40, color=target_color, label="target start")
+    ax.scatter([xy_real[0, 0]], [xy_real[0, 1]], marker="s", s=40, color=test_color, label="test start")
     i_real_min = int(np.nanargmin(xy_real_dist))
     i_ref_min = int(np.nanargmin(ref_dist))
     ax.scatter([xy_real[i_real_min, 0]], [xy_real[i_real_min, 1]], marker="x", s=70,
-               color="tab:blue", label="real closest (test)")
+               color=test_color, label="real closest (test)")
     ax.scatter([xy_target[i_real_min, 0]], [xy_target[i_real_min, 1]], marker="x", s=70,
-               color="tab:green", label="real closest (target)")
+               color=target_color, label="real closest (target)")
     ax.scatter([ref_xy[i_ref_min, 0]], [ref_xy[i_ref_min, 1]], marker="^", s=70,
                color="tab:orange", label="ref closest (ref)")
     ax.scatter([target_xy[i_ref_min, 0]], [target_xy[i_ref_min, 1]], marker="^", s=70,
-               facecolors="none", edgecolors="tab:green", linewidths=1.4, label="ref closest (target)")
+               facecolors="none", edgecolors=target_color, linewidths=1.4, label="ref closest (target)")
     ax.set_title("XY trajectory comparison (selected work segment)")
     ax.set_xlabel("X / m")
     ax.set_ylabel("Y / m")
@@ -1025,6 +1030,7 @@ def build_arg_parser(defaults):
     parser.add_argument("--max-yaw-rate", type=float, default=defaults["max_yaw_rate"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
     parser.add_argument("--max-side-step-deg", type=float, default=defaults["max_side_step_deg"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
     parser.add_argument("--post-ref-closest-window", type=float, default=defaults["post_ref_closest_window"], help="approach metrics end this many seconds after ref closest point")
+    parser.add_argument("--ref-collision-threshold", type=float, default=defaults["ref_collision_threshold"], help="stop reference trajectory once ref-target distance is within this threshold in meters")
     parser.add_argument("--out-dir", default=defaults["out_dir"], help="output directory, default reference_out_<bagstem>")
     return parser
 
@@ -1064,6 +1070,8 @@ def main():
         fail("--tau-lat must be positive", 2)
     if args.lambda_window_size < 2:
         fail("--lambda-window-size must be at least 2", 2)
+    if args.ref_collision_threshold <= 0:
+        fail("--ref-collision-threshold must be positive", 2)
 
     try:
         import rosbag
@@ -1249,7 +1257,8 @@ def main():
     xy_real_full = real_xy.copy()
     xy_real_dist_full = np.linalg.norm(xy_target_full - xy_real_full, axis=1)
     full_ref_min_idx = int(np.nanargmin(ref_dist))
-    ref_collision_reached = float(ref_dist[full_ref_min_idx]) <= REF_COLLISION_THRESHOLD_M
+    ref_collision_threshold = float(args.ref_collision_threshold)
+    ref_collision_reached = float(ref_dist[full_ref_min_idx]) <= ref_collision_threshold
     ref_collision_rel_t = None
     if ref_collision_reached:
         stop_n = full_ref_min_idx + 1
@@ -1297,7 +1306,7 @@ def main():
         "ref_final_dist": float(ref_dist[-1]),
         "whole_rmse": rmse(total_err),
         "ref_collision_reached": ref_collision_reached,
-        "ref_collision_threshold_m": REF_COLLISION_THRESHOLD_M,
+        "ref_collision_threshold_m": ref_collision_threshold,
         "ref_collision_time": ref_collision_rel_t,
     }
 
@@ -1389,7 +1398,7 @@ def main():
         "selected_mode_pattern": selected_pattern,
         "work_exact": mode_exact,
         "work_index": work_index,
-        "ref_collision_threshold_m": REF_COLLISION_THRESHOLD_M,
+        "ref_collision_threshold_m": ref_collision_threshold,
         "ref_collision_reached": ref_collision_reached,
         "ref_collision_time_since_work_start_s": "none" if ref_collision_rel_t is None else f"{ref_collision_rel_t:.6f}",
     }
