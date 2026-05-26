@@ -789,6 +789,100 @@ def finite_max_abs(x):
     return float(np.max(np.abs(x))) if len(x) else float("nan")
 
 
+def first_threshold_crossing(ref_xy, target_xy, threshold_m: float):
+    """Return (segment_start_index, alpha) for first ref-target threshold crossing."""
+    ref_xy = np.asarray(ref_xy, dtype=float)
+    target_xy = np.asarray(target_xy, dtype=float)
+    threshold2 = float(threshold_m) * float(threshold_m)
+    if len(ref_xy) == 0:
+        return None
+
+    rel0 = ref_xy[0] - target_xy[0]
+    if float(np.dot(rel0, rel0)) <= threshold2:
+        return 0, 0.0
+
+    for i in range(1, len(ref_xy)):
+        r0 = ref_xy[i - 1] - target_xy[i - 1]
+        r1 = ref_xy[i] - target_xy[i]
+        dr = r1 - r0
+        a = float(np.dot(dr, dr))
+        b = float(2.0 * np.dot(r0, dr))
+        c = float(np.dot(r0, r0) - threshold2)
+
+        if c <= 0.0:
+            return i - 1, 0.0
+        if a < 1e-12:
+            continue
+
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            continue
+
+        sqrt_disc = math.sqrt(max(0.0, disc))
+        roots = sorted(((-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)))
+        for root in roots:
+            if -1e-9 <= root <= 1.0 + 1e-9:
+                return i - 1, clamp(root, 0.0, 1.0)
+
+    return None
+
+
+def lerp_angle(a0: float, a1: float, alpha: float) -> float:
+    return wrap_pi_scalar(float(a0) + float(alpha) * wrap_pi_scalar(float(a1) - float(a0)))
+
+
+def trim_reference_at_collision(grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, threshold_m: float):
+    crossing = first_threshold_crossing(ref_xy, target_xy, threshold_m)
+    if crossing is None:
+        return grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, False, None
+
+    seg_start, alpha = crossing
+    if alpha <= 1e-9:
+        stop_n = seg_start + 1
+        grid_t = grid_t[:stop_n]
+        rel_t = rel_t[:stop_n]
+        target_xy = target_xy[:stop_n]
+        real_xy = real_xy[:stop_n]
+        ref_xy = ref_xy[:stop_n]
+        ref_heading = ref_heading[:stop_n]
+        for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd", "a_lat_cmd", "v_lat_cmd"):
+            ref[key] = ref[key][:stop_n]
+        return grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, True, float(rel_t[-1])
+
+    if alpha >= 1.0 - 1e-9:
+        stop_n = seg_start + 2
+        grid_t = grid_t[:stop_n]
+        rel_t = rel_t[:stop_n]
+        target_xy = target_xy[:stop_n]
+        real_xy = real_xy[:stop_n]
+        ref_xy = ref_xy[:stop_n]
+        ref_heading = ref_heading[:stop_n]
+        for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd", "a_lat_cmd", "v_lat_cmd"):
+            ref[key] = ref[key][:stop_n]
+        return grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, True, float(rel_t[-1])
+
+    j = seg_start
+    collision_t = (1.0 - alpha) * grid_t[j] + alpha * grid_t[j + 1]
+    collision_rel_t = (1.0 - alpha) * rel_t[j] + alpha * rel_t[j + 1]
+    collision_target = (1.0 - alpha) * target_xy[j] + alpha * target_xy[j + 1]
+    collision_real = (1.0 - alpha) * real_xy[j] + alpha * real_xy[j + 1]
+    collision_ref = (1.0 - alpha) * ref_xy[j] + alpha * ref_xy[j + 1]
+    collision_heading = lerp_angle(ref_heading[j], ref_heading[j + 1], alpha)
+
+    grid_t = np.concatenate([grid_t[:j + 1], np.asarray([collision_t])])
+    rel_t = np.concatenate([rel_t[:j + 1], np.asarray([collision_rel_t])])
+    target_xy = np.vstack([target_xy[:j + 1], collision_target])
+    real_xy = np.vstack([real_xy[:j + 1], collision_real])
+    ref_xy = np.vstack([ref_xy[:j + 1], collision_ref])
+    ref_heading = np.concatenate([ref_heading[:j + 1], np.asarray([collision_heading])])
+
+    for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd", "a_lat_cmd", "v_lat_cmd"):
+        collision_value = (1.0 - alpha) * ref[key][j] + alpha * ref[key][j + 1]
+        ref[key] = np.concatenate([ref[key][:j + 1], np.asarray([collision_value])])
+
+    return grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, True, float(collision_rel_t)
+
+
 def make_plots(out_dir, rel_t, target_xy, real_xy, ref_xy, ref_heading,
                total_err, along_err, cross_err, real_dist, ref_dist,
                lambda_real, lambda_ref, eval_end_rel,
@@ -1256,21 +1350,19 @@ def main():
     xy_target_full = target_xy.copy()
     xy_real_full = real_xy.copy()
     xy_real_dist_full = np.linalg.norm(xy_target_full - xy_real_full, axis=1)
-    full_ref_min_idx = int(np.nanargmin(ref_dist))
     ref_collision_threshold = float(args.ref_collision_threshold)
-    ref_collision_reached = float(ref_dist[full_ref_min_idx]) <= ref_collision_threshold
-    ref_collision_rel_t = None
-    if ref_collision_reached:
-        stop_n = full_ref_min_idx + 1
-        grid_t = grid_t[:stop_n]
-        rel_t = rel_t[:stop_n]
-        target_xy = target_xy[:stop_n]
-        real_xy = real_xy[:stop_n]
-        ref_xy = ref_xy[:stop_n]
-        ref_heading = ref_heading[:stop_n]
-        for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd", "a_lat_cmd", "v_lat_cmd"):
-            ref[key] = ref[key][:stop_n]
-        ref_collision_rel_t = float(rel_t[-1])
+    grid_t, rel_t, target_xy, real_xy, ref_xy, ref_heading, ref, ref_collision_reached, ref_collision_rel_t = (
+        trim_reference_at_collision(
+            grid_t=grid_t,
+            rel_t=rel_t,
+            target_xy=target_xy,
+            real_xy=real_xy,
+            ref_xy=ref_xy,
+            ref_heading=ref_heading,
+            ref=ref,
+            threshold_m=ref_collision_threshold,
+        )
+    )
 
     total_err, along_err, cross_err = compute_component_errors(grid_t, real_xy, ref_xy, ref_heading)
     real_dist = np.linalg.norm(target_xy - real_xy, axis=1)
