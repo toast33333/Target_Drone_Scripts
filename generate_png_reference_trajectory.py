@@ -26,10 +26,14 @@ Notes:
     recorded bags for this project, the real interception/control segment can
     be reported by MAVROS as GUIDED even though the operation is described as
     starting from AUTO.
-  - Default PNG parameters are chosen from the project context: N=5, V=5 m/s.
+  - The reference generator follows the horizontal logic in rpy_png_no_alt.cpp:
+    LOS rate Kalman filter -> PNG lateral acceleration -> filtered lateral
+    velocity -> world-frame velocity command.
+  - Default PNG parameters follow the project launch defaults: N=3, V=5 m/s.
 """
 
 import argparse
+import configparser
 import csv
 import math
 import os
@@ -45,6 +49,124 @@ VEL_SUFFIX = "mavros/local_position/velocity_local"
 STATE_SUFFIX = "mavros/state"
 REF_COLLISION_THRESHOLD_M = 0.15
 
+DEFAULT_ARGS = {
+    "ego_pose_topic": None,
+    "target_pose_topic": None,
+    "state_topic": None,
+    "ego_velocity_topic": None,
+    "work_mode": "auto",
+    "work_exact": False,
+    "work_index": None,
+    "auto_mode": None,
+    "auto_exact": False,
+    "auto_index": None,
+    "dt": 0.05,
+    "speed": "5.0",
+    "N": 3.0,
+    "v_lat_max": 3.0,
+    "tau_lat": 0.5,
+    "lambda_alpha": 0.2,
+    "lambda_window_size": 5,
+    "lambda_kalman_q_position": None,
+    "lambda_kalman_q_rate": None,
+    "lambda_kalman_r": None,
+    "heading_source": "auto",
+    "k_yaw": 1.5,
+    "k_yaw_d": 0.3,
+    "max_yaw_rate": 1.0,
+    "max_side_step_deg": 30.0,
+    "post_ref_closest_window": 0.5,
+    "out_dir": None,
+}
+
+CONFIG_TYPES = {
+    "ego_pose_topic": str,
+    "target_pose_topic": str,
+    "state_topic": str,
+    "ego_velocity_topic": str,
+    "work_mode": str,
+    "work_exact": bool,
+    "work_index": int,
+    "auto_mode": str,
+    "auto_exact": bool,
+    "auto_index": int,
+    "dt": float,
+    "speed": str,
+    "N": float,
+    "v_lat_max": float,
+    "tau_lat": float,
+    "lambda_alpha": float,
+    "lambda_window_size": int,
+    "lambda_kalman_q_position": float,
+    "lambda_kalman_q_rate": float,
+    "lambda_kalman_r": float,
+    "heading_source": str,
+    "k_yaw": float,
+    "k_yaw_d": float,
+    "max_yaw_rate": float,
+    "max_side_step_deg": float,
+    "post_ref_closest_window": float,
+    "out_dir": str,
+}
+
+CONFIG_TEMPLATE = """# PNG reference trajectory analysis config.
+# Usage:
+#   python3 generate_png_reference_trajectory.py 03.bag --config png_reference_flight_config.ini
+#
+# Command-line arguments override values in this file.
+# Empty values mean auto/default where supported.
+
+[topics]
+# Leave empty to auto-detect.
+ego_pose_topic =
+target_pose_topic =
+state_topic =
+ego_velocity_topic =
+
+[work_segment]
+# auto means prefer GUIDED, then AUTO. Use AUTO or GUIDED to force one mode.
+work_mode = auto
+work_exact = false
+# Empty means 0. Set 1, 2, ... when one mode appears in multiple intervals.
+work_index =
+
+[reference_model]
+# Match these values to the parameters used in the real flight.
+dt = 0.05
+speed = 5.0
+N = 3.0
+v_lat_max = 3.0
+tau_lat = 0.5
+
+# These two legacy values are mapped to Kalman noise by the same rule as the
+# real project. Usually keep them unless the flight launch file changed them.
+lambda_alpha = 0.2
+lambda_window_size = 5
+
+# Leave empty to use the mapped defaults above. Fill numbers only if the flight
+# explicitly set lambda_kalman_* parameters.
+lambda_kalman_q_position =
+lambda_kalman_q_rate =
+lambda_kalman_r =
+
+# auto: use bag pose yaw if available, otherwise use reference course.
+# bag-yaw: require pose yaw.
+# course: always use generated trajectory course.
+heading_source = auto
+
+[legacy_compatibility]
+# Kept only so older command lines/configs do not break. The current
+# rpy_png_no_alt-style model does not use these values.
+k_yaw = 1.5
+k_yaw_d = 0.3
+max_yaw_rate = 1.0
+max_side_step_deg = 30.0
+
+[output]
+post_ref_closest_window = 0.5
+out_dir =
+"""
+
 
 def fail(msg: str, code: int = 1):
     print("[ERROR] " + msg, file=sys.stderr)
@@ -53,6 +175,57 @@ def fail(msg: str, code: int = 1):
 
 def warn(msg: str):
     print("[WARN] " + msg, file=sys.stderr)
+
+
+def parse_bool(value: str) -> bool:
+    v = str(value).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def coerce_config_value(key: str, value: str):
+    text = str(value).strip()
+    if text == "":
+        return None if DEFAULT_ARGS.get(key) is None else DEFAULT_ARGS[key]
+    typ = CONFIG_TYPES[key]
+    if typ is bool:
+        return parse_bool(text)
+    if typ is str:
+        return text
+    return typ(text)
+
+
+def read_config_defaults(config_path: Path):
+    config_path = Path(config_path).expanduser().resolve()
+    if not config_path.exists():
+        fail(f"config file not found: {config_path}", 2)
+
+    cp = configparser.ConfigParser()
+    cp.optionxform = str
+    cp.read(config_path, encoding="utf-8-sig")
+
+    defaults = {}
+    known = set(DEFAULT_ARGS)
+    for section in cp.sections():
+        for key, value in cp.items(section):
+            if key not in known:
+                warn(f"unknown config key ignored: [{section}] {key}")
+                continue
+            try:
+                defaults[key] = coerce_config_value(key, value)
+            except ValueError as e:
+                fail(f"bad config value for [{section}] {key}: {e}", 2)
+    return defaults
+
+
+def write_config_template(path: Path):
+    path = Path(path).expanduser().resolve()
+    ensure_dir(path.parent)
+    path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+    return path
 
 
 def ensure_dir(path: Path):
@@ -73,6 +246,85 @@ def wrap_pi_scalar(a: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+class ScalarRateKalmanFilter:
+    """Python equivalent of png_planner/src/los_rate_kalman.h."""
+
+    def __init__(self, q_position: float = 1e-4, q_rate: float = 5e-1, r_measurement: float = 2e-4):
+        self.set_noise(q_position, q_rate, r_measurement)
+        self.reset()
+
+    def set_noise(self, q_position: float, q_rate: float, r_measurement: float):
+        self.process_noise_position = max(float(q_position), 1e-9)
+        self.process_noise_rate = max(float(q_rate), 1e-9)
+        self.measurement_noise = max(float(r_measurement), 1e-9)
+
+    def reset(self):
+        self.initialized = False
+        self._value = 0.0
+        self._rate = 0.0
+        self.p00 = 1.0
+        self.p01 = 0.0
+        self.p10 = 0.0
+        self.p11 = 1.0
+
+    def update(self, measurement: float, dt: float):
+        dt = max(float(dt), 1e-4)
+        measurement = float(measurement)
+
+        if not self.initialized:
+            self.initialized = True
+            self._value = measurement
+            self._rate = 0.0
+            self.p00 = 1.0
+            self.p01 = 0.0
+            self.p10 = 0.0
+            self.p11 = 1.0
+            return
+
+        self._value += dt * self._rate
+
+        predicted_p00 = (
+            self.p00
+            + dt * (self.p10 + self.p01)
+            + dt * dt * self.p11
+            + self.process_noise_position * dt * dt
+        )
+        predicted_p01 = self.p01 + dt * self.p11
+        predicted_p10 = self.p10 + dt * self.p11
+        predicted_p11 = self.p11 + self.process_noise_rate * dt
+
+        innovation = measurement - self._value
+        innovation_cov = predicted_p00 + self.measurement_noise
+        k0 = predicted_p00 / innovation_cov
+        k1 = predicted_p10 / innovation_cov
+
+        self._value += k0 * innovation
+        self._rate += k1 * innovation
+
+        self.p00 = (1.0 - k0) * predicted_p00
+        self.p01 = (1.0 - k0) * predicted_p01
+        self.p10 = self.p01
+        self.p11 = predicted_p11 - k1 * predicted_p01
+
+    def value(self) -> float:
+        return self._value
+
+    def rate(self) -> float:
+        return self._rate
+
+
+def map_legacy_los_chain_to_kalman(alpha: float, window_size: int):
+    """Match mapLegacyLosChainToKalman() from the real project."""
+    alpha = clamp(float(alpha), 0.05, 0.95)
+    window = max(2, int(window_size))
+    alpha_scale = alpha / 0.2
+    window_scale = 3.0 / float(window)
+    q_position = max(1e-6, 1e-4 * alpha_scale * window_scale)
+    q_rate = max(1e-3, 5e-1 * alpha_scale * window_scale)
+    r_measurement = max(1e-6, 2e-4 * (0.2 / alpha) * (0.2 / alpha) / window_scale)
+    return q_position, q_rate, r_measurement
 
 
 def write_csv(path: Path, header: Sequence[str], rows: Iterable[Sequence]):
@@ -105,6 +357,13 @@ def interp_xy(t_src, xy_src, t_dst):
     ])
 
 
+def interp_angle_series(t_src, angle_src, t_dst):
+    angle_src = np.asarray(angle_src, dtype=float)
+    if len(angle_src) == 0:
+        return np.full_like(np.asarray(t_dst, dtype=float), np.nan, dtype=float)
+    return wrap_pi(interp_series(t_src, np.unwrap(angle_src), t_dst))
+
+
 def _has_chain(obj, chain):
     cur = obj
     for name in chain:
@@ -127,6 +386,28 @@ def extract_xyz_from_pose_like(msg):
                 cur = getattr(cur, name)
             if all(hasattr(cur, k) for k in ("x", "y", "z")):
                 return float(cur.x), float(cur.y), float(cur.z)
+    return None
+
+
+def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def extract_yaw_from_pose_like(msg):
+    candidates = [
+        ("pose", "orientation"),
+        ("pose", "pose", "orientation"),
+        ("orientation",),
+    ]
+    for chain in candidates:
+        if _has_chain(msg, chain):
+            cur = msg
+            for name in chain:
+                cur = getattr(cur, name)
+            if all(hasattr(cur, k) for k in ("x", "y", "z", "w")):
+                return quaternion_to_yaw(float(cur.x), float(cur.y), float(cur.z), float(cur.w))
     return None
 
 
@@ -205,6 +486,19 @@ def read_pose_series(bag, topic: str, t0: float):
     if len(ts) < 2:
         return None
     return np.asarray(ts, dtype=float), np.asarray(xyz, dtype=float)
+
+
+def read_yaw_series(bag, topic: str, t0: float):
+    ts, yaws = [], []
+    for _, msg, t in bag.read_messages(topics=[topic]):
+        yaw = extract_yaw_from_pose_like(msg)
+        if yaw is None:
+            continue
+        ts.append(to_sec(t) - t0)
+        yaws.append(yaw)
+    if len(ts) < 2:
+        return None
+    return np.asarray(ts, dtype=float), np.asarray(yaws, dtype=float)
 
 
 def read_velocity_series(bag, topic: str, t0: float):
@@ -356,11 +650,12 @@ def simulate_png_reference(
     initial_heading,
     speed,
     n_nav,
-    k_yaw,
-    k_yaw_d,
-    max_yaw_rate,
-    lambda_alpha,
-    max_side_step_rad,
+    v_lat_max,
+    tau_lat,
+    lambda_kalman_q_position,
+    lambda_kalman_q_rate,
+    lambda_kalman_r,
+    heading_profile=None,
 ):
     n = len(grid_t)
     ref_xy = np.zeros((n, 2), dtype=float)
@@ -369,53 +664,85 @@ def simulate_png_reference(
     lambda_filt = np.zeros(n, dtype=float)
     lambda_dot = np.zeros(n, dtype=float)
     yaw_rate_cmd = np.zeros(n, dtype=float)
+    a_lat_cmd = np.zeros(n, dtype=float)
+    v_lat_cmd = np.zeros(n, dtype=float)
 
     ref_xy[0] = np.asarray(start_xy, dtype=float)
     ref_heading[0] = float(initial_heading)
 
-    los0 = math.atan2(target_xy[0, 1] - ref_xy[0, 1], target_xy[0, 0] - ref_xy[0, 0])
-    lambda_raw[0] = wrap_pi_scalar(los0 - ref_heading[0])
-    lambda_filt[0] = lambda_raw[0]
-    prev_filt = lambda_filt[0]
+    if heading_profile is not None:
+        heading_profile = np.asarray(heading_profile, dtype=float)
+        if len(heading_profile) != n:
+            raise ValueError("heading_profile length must match grid_t")
+
+    lambda_filter = ScalarRateKalmanFilter(
+        lambda_kalman_q_position,
+        lambda_kalman_q_rate,
+        lambda_kalman_r,
+    )
+    v_lat = 0.0
+    course_heading = float(initial_heading)
+
+    def body_yaw_at(idx: int, fallback: float) -> float:
+        if heading_profile is not None and np.isfinite(heading_profile[idx]):
+            return float(heading_profile[idx])
+        return float(fallback)
 
     for i in range(1, n):
         dt = max(1e-3, float(grid_t[i] - grid_t[i - 1]))
         prev_pos = ref_xy[i - 1]
-        prev_heading = ref_heading[i - 1]
+        yaw_b = body_yaw_at(i - 1, course_heading)
+        ref_heading[i - 1] = yaw_b
 
         los = math.atan2(target_xy[i - 1, 1] - prev_pos[1], target_xy[i - 1, 0] - prev_pos[0])
-        raw = wrap_pi_scalar(los - prev_heading)
+        # The online node receives lambda_meas = -gimbal_yaw_.  Offline, the
+        # target/reference geometry gives the same horizontal LOS bearing error.
+        raw = wrap_pi_scalar(los - yaw_b)
         lambda_raw[i - 1] = raw
 
-        delta = wrap_pi_scalar(raw - prev_filt)
-        filt = wrap_pi_scalar(prev_filt + lambda_alpha * delta)
+        if lambda_filter.initialized:
+            measurement = lambda_filter.value() + wrap_pi_scalar(raw - lambda_filter.value())
+        else:
+            measurement = raw
+        lambda_filter.update(measurement, dt)
+        filt = wrap_pi_scalar(lambda_filter.value())
+        rate = lambda_filter.rate()
         lambda_filt[i - 1] = filt
-        rate = wrap_pi_scalar(filt - prev_filt) / dt
-        prev_filt = filt
         lambda_dot[i - 1] = rate
 
-        side_step = clamp(n_nav * rate * dt, -max_side_step_rad, max_side_step_rad)
-        vx_body = speed * math.cos(side_step)
-        vy_body = speed * math.sin(side_step)
+        a_lat = n_nav * speed * rate
+        v_lat_target = clamp(v_lat + a_lat * dt, -abs(v_lat_max), abs(v_lat_max))
+        alpha = dt / max(float(tau_lat), dt)
+        v_lat = (1.0 - alpha) * v_lat + alpha * v_lat_target
+        a_lat_cmd[i - 1] = a_lat
+        v_lat_cmd[i - 1] = v_lat
 
-        yaw_rate = 0.0
-        if abs(filt) > math.radians(0.1):
-            yaw_rate = clamp(k_yaw * filt + k_yaw_d * rate, -max_yaw_rate, max_yaw_rate)
-        yaw_rate_cmd[i - 1] = yaw_rate
+        vx_body = speed
+        vy_body = v_lat
 
-        c, s = math.cos(prev_heading), math.sin(prev_heading)
+        c, s = math.cos(yaw_b), math.sin(yaw_b)
         vx_world = vx_body * c - vy_body * s
         vy_world = vx_body * s + vy_body * c
 
         ref_xy[i] = prev_pos + np.array([vx_world, vy_world]) * dt
-        ref_heading[i] = wrap_pi_scalar(prev_heading + yaw_rate * dt)
+
+        if heading_profile is None:
+            if math.hypot(vx_world, vy_world) > 1e-6:
+                course_heading = math.atan2(vy_world, vx_world)
+            ref_heading[i] = course_heading
+        else:
+            ref_heading[i] = body_yaw_at(i, yaw_b)
 
     if n > 1:
-        los = np.arctan2(target_xy[-1, 1] - ref_xy[-1, 1], target_xy[-1, 0] - ref_xy[-1, 0])
-        lambda_raw[-1] = wrap_pi_scalar(float(los - ref_heading[-1]))
-        lambda_filt[-1] = lambda_filt[-2]
-        lambda_dot[-1] = lambda_dot[-2]
-        yaw_rate_cmd[-1] = yaw_rate_cmd[-2]
+        final_yaw = body_yaw_at(n - 1, course_heading)
+        ref_heading[-1] = final_yaw
+        los = math.atan2(target_xy[-1, 1] - ref_xy[-1, 1], target_xy[-1, 0] - ref_xy[-1, 0])
+        lambda_raw[-1] = wrap_pi_scalar(los - final_yaw)
+        lambda_filt[-1] = wrap_pi_scalar(lambda_filter.value()) if lambda_filter.initialized else lambda_raw[-1]
+        lambda_dot[-1] = lambda_filter.rate() if lambda_filter.initialized else 0.0
+        yaw_rate_cmd[-1] = 0.0
+        a_lat_cmd[-1] = a_lat_cmd[-2]
+        v_lat_cmd[-1] = v_lat_cmd[-2]
 
     return {
         "xy": ref_xy,
@@ -424,6 +751,8 @@ def simulate_png_reference(
         "lambda_filt": lambda_filt,
         "lambda_dot": lambda_dot,
         "yaw_rate_cmd": yaw_rate_cmd,
+        "a_lat_cmd": a_lat_cmd,
+        "v_lat_cmd": v_lat_cmd,
     }
 
 
@@ -650,46 +979,91 @@ def write_summary(
             f.write(f"  {item}\n")
 
 
-def parse_args():
+def build_arg_parser(defaults):
     parser = argparse.ArgumentParser(
-        description="Generate a horizontal PNG reference trajectory and compare it with the real work-segment trajectory."
+        description="Generate a horizontal PNG reference trajectory and compare it with the real work-segment trajectory.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("bag", help="ROS1 bag path")
-    parser.add_argument("--ego-pose-topic", default=None, help="default: auto-detect /mavros/local_position/pose")
-    parser.add_argument("--target-pose-topic", default=None, help="default: auto-detect /target/mavros/local_position/pose")
-    parser.add_argument("--state-topic", default=None, help="default: auto-detect /mavros/state")
-    parser.add_argument("--ego-velocity-topic", default=None, help="optional, used for initial heading if available")
+    parser.add_argument("bag", nargs="?", help="ROS1 bag path")
+    parser.add_argument("--config", default=None, help="optional .ini config file for one flight/test run")
+    parser.add_argument(
+        "--write-config-template",
+        nargs="?",
+        const="png_reference_flight_config.ini",
+        default=None,
+        help="write a tunable .ini template and exit. Optional path can be supplied.",
+    )
+    parser.add_argument("--ego-pose-topic", default=defaults["ego_pose_topic"], help="default: auto-detect /mavros/local_position/pose")
+    parser.add_argument("--target-pose-topic", default=defaults["target_pose_topic"], help="default: auto-detect /target/mavros/local_position/pose")
+    parser.add_argument("--state-topic", default=defaults["state_topic"], help="default: auto-detect /mavros/state")
+    parser.add_argument("--ego-velocity-topic", default=defaults["ego_velocity_topic"], help="optional, used for initial heading if available")
     parser.add_argument(
         "--work-mode",
-        default="auto",
+        default=defaults["work_mode"],
         help="work mode selector. default 'auto' means prefer GUIDED, then AUTO. "
              "Can also be a substring or comma list, e.g. GUIDED or GUIDED,AUTO.",
     )
-    parser.add_argument("--work-exact", action="store_true", help="require exact work-mode match instead of substring match")
-    parser.add_argument("--work-index", type=int, default=None, help="which matched work interval to analyze, default 0")
-    parser.add_argument("--auto-mode", default=None, help="deprecated alias of --work-mode")
-    parser.add_argument("--auto-exact", action="store_true", help="deprecated alias of --work-exact")
-    parser.add_argument("--auto-index", type=int, default=None, help="deprecated alias of --work-index")
-    parser.add_argument("--dt", type=float, default=0.05, help="reference time step, default 0.05s")
-    parser.add_argument("--speed", default="10.0", help="reference speed in m/s, or 'auto' to use median real work-segment speed")
-    parser.add_argument("--N", type=float, default=5.0, help="PNG navigation constant, default 5")
-    parser.add_argument("--k-yaw", type=float, default=1.5, help="yaw proportional gain used in reference heading update")
-    parser.add_argument("--k-yaw-d", type=float, default=0.3, help="yaw rate damping gain used in reference heading update")
-    parser.add_argument("--max-yaw-rate", type=float, default=1.0, help="max yaw rate in rad/s")
-    parser.add_argument("--lambda-alpha", type=float, default=0.2, help="LOS bearing error smoothing alpha")
-    parser.add_argument("--max-side-step-deg", type=float, default=30.0, help="limit of one-step PNG side-slip angle")
-    parser.add_argument("--post-ref-closest-window", type=float, default=0.5, help="approach metrics end this many seconds after ref closest point")
-    parser.add_argument("--out-dir", default=None, help="output directory, default reference_out_<bagstem>")
+    parser.add_argument("--work-exact", action="store_true", default=defaults["work_exact"], help="require exact work-mode match instead of substring match")
+    parser.add_argument("--work-index", type=int, default=defaults["work_index"], help="which matched work interval to analyze, default 0")
+    parser.add_argument("--auto-mode", default=defaults["auto_mode"], help="deprecated alias of --work-mode")
+    parser.add_argument("--auto-exact", action="store_true", default=defaults["auto_exact"], help="deprecated alias of --work-exact")
+    parser.add_argument("--auto-index", type=int, default=defaults["auto_index"], help="deprecated alias of --work-index")
+    parser.add_argument("--dt", type=float, default=defaults["dt"], help="reference time step")
+    parser.add_argument("--speed", default=defaults["speed"], help="V_forward in m/s, or 'auto' to use median real work-segment speed")
+    parser.add_argument("--N", type=float, default=defaults["N"], help="N_nav PNG navigation constant")
+    parser.add_argument("--v-lat-max", type=float, default=defaults["v_lat_max"], help="v_lat_max lateral speed limit in m/s")
+    parser.add_argument("--tau-lat", type=float, default=defaults["tau_lat"], help="tau_lat lateral-speed first-order time constant in seconds")
+    parser.add_argument("--lambda-alpha", type=float, default=defaults["lambda_alpha"], help="legacy lambda_filt_alpha used only to derive Kalman noise defaults")
+    parser.add_argument("--lambda-window-size", type=int, default=defaults["lambda_window_size"], help="legacy lambda_window_size used only to derive Kalman noise defaults")
+    parser.add_argument("--lambda-kalman-q-position", type=float, default=defaults["lambda_kalman_q_position"], help="override lambda_kalman_q_position; default is mapped from alpha/window like the project")
+    parser.add_argument("--lambda-kalman-q-rate", type=float, default=defaults["lambda_kalman_q_rate"], help="override lambda_kalman_q_rate; default is mapped from alpha/window like the project")
+    parser.add_argument("--lambda-kalman-r", type=float, default=defaults["lambda_kalman_r"], help="override lambda_kalman_r; default is mapped from alpha/window like the project")
+    parser.add_argument("--heading-source", choices=["auto", "bag-yaw", "course"], default=defaults["heading_source"],
+                        help="body yaw used when rotating body velocity to world frame. auto uses bag pose yaw if available, else course")
+    parser.add_argument("--k-yaw", type=float, default=defaults["k_yaw"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
+    parser.add_argument("--k-yaw-d", type=float, default=defaults["k_yaw_d"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
+    parser.add_argument("--max-yaw-rate", type=float, default=defaults["max_yaw_rate"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
+    parser.add_argument("--max-side-step-deg", type=float, default=defaults["max_side_step_deg"], help="legacy option kept for CLI compatibility; not used by rpy_png_no_alt model")
+    parser.add_argument("--post-ref-closest-window", type=float, default=defaults["post_ref_closest_window"], help="approach metrics end this many seconds after ref closest point")
+    parser.add_argument("--out-dir", default=defaults["out_dir"], help="output directory, default reference_out_<bagstem>")
+    return parser
+
+
+def parse_args():
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=None)
+    pre_parser.add_argument("--write-config-template", nargs="?", const="png_reference_flight_config.ini", default=None)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    defaults = dict(DEFAULT_ARGS)
+    if pre_args.config:
+        defaults.update(read_config_defaults(Path(pre_args.config)))
+
+    parser = build_arg_parser(defaults)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.write_config_template:
+        config_path = write_config_template(Path(args.write_config_template))
+        print("[DONE] Config template:", config_path)
+        return
+
+    if not args.bag:
+        fail("bag path is required. Use --write-config-template to create a config file without analyzing a bag.", 2)
+
     bag_path = Path(args.bag).expanduser().resolve()
     if not bag_path.exists():
         fail(f"bag not found: {bag_path}", 2)
     if args.dt <= 0:
         fail("--dt must be positive", 2)
+    if args.v_lat_max <= 0:
+        fail("--v-lat-max must be positive", 2)
+    if args.tau_lat <= 0:
+        fail("--tau-lat must be positive", 2)
+    if args.lambda_window_size < 2:
+        fail("--lambda-window-size must be at least 2", 2)
 
     try:
         import rosbag
@@ -728,6 +1102,7 @@ def main():
             fail("missing ego state topic. Use --state-topic, or record /mavros/state.", 5)
 
         ego_pose = read_pose_series(bag, ego_pose_topic, start_abs)
+        ego_yaw = read_yaw_series(bag, ego_pose_topic, start_abs)
         target_pose = read_pose_series(bag, target_pose_topic, start_abs)
         state_series = read_state_series(bag, state_topic, start_abs)
         ego_vel = read_velocity_series(bag, ego_vel_topic, start_abs) if ego_vel_topic else None
@@ -819,6 +1194,39 @@ def main():
     if initial_heading is None:
         initial_heading = math.atan2(target_xy[0, 1] - real_xy[0, 1], target_xy[0, 0] - real_xy[0, 0])
 
+    heading_profile = None
+    heading_source_used = "reference_course"
+    if args.heading_source in ("auto", "bag-yaw"):
+        if ego_yaw is not None:
+            yaw_t, yaw_values = ego_yaw
+            heading_profile = interp_angle_series(yaw_t, yaw_values, grid_t)
+            if np.any(np.isfinite(heading_profile)):
+                heading_source_used = "bag_pose_yaw"
+                if np.isfinite(heading_profile[0]):
+                    initial_heading = float(heading_profile[0])
+            elif args.heading_source == "bag-yaw":
+                fail("bag pose yaw could not be interpolated for the selected work interval", 6)
+            else:
+                heading_profile = None
+        elif args.heading_source == "bag-yaw":
+            fail("ego pose topic does not contain usable orientation yaw", 6)
+
+    lambda_q_position_default, lambda_q_rate_default, lambda_r_default = map_legacy_los_chain_to_kalman(
+        args.lambda_alpha,
+        args.lambda_window_size,
+    )
+    lambda_q_position = (
+        lambda_q_position_default
+        if args.lambda_kalman_q_position is None
+        else args.lambda_kalman_q_position
+    )
+    lambda_q_rate = (
+        lambda_q_rate_default
+        if args.lambda_kalman_q_rate is None
+        else args.lambda_kalman_q_rate
+    )
+    lambda_r = lambda_r_default if args.lambda_kalman_r is None else args.lambda_kalman_r
+
     ref = simulate_png_reference(
         grid_t=grid_t,
         target_xy=target_xy,
@@ -826,11 +1234,12 @@ def main():
         initial_heading=initial_heading,
         speed=spd,
         n_nav=args.N,
-        k_yaw=args.k_yaw,
-        k_yaw_d=args.k_yaw_d,
-        max_yaw_rate=args.max_yaw_rate,
-        lambda_alpha=args.lambda_alpha,
-        max_side_step_rad=math.radians(args.max_side_step_deg),
+        v_lat_max=args.v_lat_max,
+        tau_lat=args.tau_lat,
+        lambda_kalman_q_position=lambda_q_position,
+        lambda_kalman_q_rate=lambda_q_rate,
+        lambda_kalman_r=lambda_r,
+        heading_profile=heading_profile,
     )
 
     ref_xy = ref["xy"]
@@ -850,7 +1259,7 @@ def main():
         real_xy = real_xy[:stop_n]
         ref_xy = ref_xy[:stop_n]
         ref_heading = ref_heading[:stop_n]
-        for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd"):
+        for key in ("lambda_raw", "lambda_filt", "lambda_dot", "yaw_rate_cmd", "a_lat_cmd", "v_lat_cmd"):
             ref[key] = ref[key][:stop_n]
         ref_collision_rel_t = float(rel_t[-1])
 
@@ -906,6 +1315,8 @@ def main():
             f"{math.degrees(lambda_real[i]) if np.isfinite(lambda_real[i]) else float('nan'):.6f}",
             f"{math.degrees(lambda_ref[i]):.6f}",
             f"{ref['lambda_dot'][i]:.6f}",
+            f"{ref['a_lat_cmd'][i]:.6f}",
+            f"{ref['v_lat_cmd'][i]:.6f}",
             f"{ref['yaw_rate_cmd'][i]:.6f}",
         ])
     write_csv(
@@ -919,7 +1330,8 @@ def main():
             "real_ref_error_xy_m", "along_track_error_m", "cross_track_error_m",
             "real_target_dist_m", "ref_target_dist_m",
             "real_los_bearing_error_deg", "ref_los_bearing_error_deg",
-            "ref_lambda_dot_rad_s", "ref_yaw_rate_cmd_rad_s",
+            "ref_lambda_dot_rad_s", "ref_a_lat_cmd_m_s2", "ref_v_lat_cmd_m_s",
+            "ref_yaw_rate_cmd_rad_s",
         ],
         rows,
     )
@@ -955,15 +1367,24 @@ def main():
 
     params = {
         "horizontal_only": True,
+        "reference_model": "rpy_png_no_alt.cpp lateral-velocity PNG",
+        "config_file": "none" if not args.config else str(Path(args.config).expanduser().resolve()),
         "N_nav": args.N,
         "reference_speed_mps": f"{spd:.6f}",
         "dt_s": args.dt,
-        "k_yaw": args.k_yaw,
-        "k_yaw_d": args.k_yaw_d,
-        "max_yaw_rate_rad_s": args.max_yaw_rate,
-        "lambda_alpha": args.lambda_alpha,
-        "max_side_step_deg": args.max_side_step_deg,
+        "v_lat_max_mps": args.v_lat_max,
+        "tau_lat_s": args.tau_lat,
+        "lambda_alpha_legacy": args.lambda_alpha,
+        "lambda_window_size_legacy": args.lambda_window_size,
+        "lambda_kalman_q_position": f"{lambda_q_position:.9g}",
+        "lambda_kalman_q_rate": f"{lambda_q_rate:.9g}",
+        "lambda_kalman_r": f"{lambda_r:.9g}",
+        "heading_source": heading_source_used,
         "initial_heading_deg": f"{math.degrees(initial_heading):.6f}",
+        "legacy_k_yaw_not_used": args.k_yaw,
+        "legacy_k_yaw_d_not_used": args.k_yaw_d,
+        "legacy_max_yaw_rate_not_used": args.max_yaw_rate,
+        "legacy_max_side_step_deg_not_used": args.max_side_step_deg,
         "work_mode_selector": mode_spec,
         "selected_mode_pattern": selected_pattern,
         "work_exact": mode_exact,
